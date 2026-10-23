@@ -1,0 +1,12 @@
+Instructions to build:
+Make sure the development libraries for qt 4.6 or greater are installed
+
+Run the following commands:
+cd qt
+qmake
+make lstune
+
+If everything went right, the executable "lstune" file should have been created.
+
+
+
