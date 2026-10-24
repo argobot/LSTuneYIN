@@ -20,9 +20,12 @@
 
 #include <QTimer>
 #include <QLabel>
+#include <QVBoxLayout>
 #include <QMessageBox>
 #include <QVariant>
 #include <QString>
+#include <QSignalBlocker>
+#include <QDebug>
 
 #include "sound.h"
 #include "wheel.h"
@@ -43,7 +46,10 @@ Tuner::Tuner(QWidget *parent)
 {
   ui.setupUi(this);   
 
+  QVBoxLayout *strobeLayout = new QVBoxLayout(ui.strobeFrame);
+  strobeLayout->setContentsMargins(0, 0, 0, 0);
   Wheel *sWheel = new Wheel(ui.strobeFrame);
+  strobeLayout->addWidget(sWheel);
   
   LED *flatLED = new LED(this);
   LED *sharpLED = new LED(this);
@@ -64,25 +70,27 @@ Tuner::Tuner(QWidget *parent)
 
   connect(aProc, &AudioProc::newAngle, sWheel, &Wheel::setAnglef);
   connect(aProc, &AudioProc::changedNote, this, &Tuner::setDisplayedNote);
-
   connect(aProc, &AudioProc::isSharp, sharpLED, &LED::setState);
   connect(aProc, &AudioProc::isFlat, flatLED, &LED::setState);
 
-  connect(ui.autoDetect, &QAbstractButton::clicked, aProc, &AudioProc::setNoteDetect);
-  connect(ui.A4SpinBox, &QDoubleSpinBox::valueChanged, aProc, &AudioProc::setA4Freq);
+  connect(ui.A4SpinBox, &QDoubleSpinBox::valueChanged, this, &Tuner::on_A4SpinBox_valueChanged);
   connect(ui.noiseGateSpinBox, &QDoubleSpinBox::valueChanged, aProc, &AudioProc::setHysteresis);
+
+  connect(ui.autoDetect, &QCheckBox::toggled, this, &Tuner::on_autoDetect_clicked);
+  connect(ui.noteSelBox, &QComboBox::currentIndexChanged, this, &Tuner::on_noteSelBox_currentIndexChanged);
 
   for (int n = 0; n < notes.total_notes; n++) {
     ui.noteSelBox->addItem(notes.get_note_offset(n)->fullName, QVariant(n));
   }
   
   aProc->start();
-// Retardo de 500ms para asegurar que PipeWire/ALSA haya inicializado el QAudioSource
-    QTimer::singleShot(500, this, [this]() {
+  on_autoDetect_clicked(ui.autoDetect->isChecked());
+
+  QTimer::singleShot(500, this, [this]() {
     const int actualSampleRate = aProc->getSampleRate();
     ui.lblSampleRate->setText(QString("Capturando a %1 Hz").arg(actualSampleRate));
-    //this->setWindowTitle(QString("LSTune - Capturando a %1 Hz").arg(actualSampleRate));
-});
+    qDebug() << "[Tuner] Frecuencia activa confirmada:" << actualSampleRate << "Hz";
+  });
 }
 
 Tuner::~Tuner()
@@ -102,7 +110,15 @@ QList<QAudioDevice> Tuner::getDevices()
 
 void Tuner::setDisplayedNote(note_t *note)
 {
+  if (!note) return;
   curNote = note;
+
+  // =========================================================================
+  // FASE 4: AUDITORÍA DE INTERFAZ GRÁFICA (GUI)
+  // =========================================================================
+  qDebug() << "[FASE 4 - GUI] setDisplayedNote recibido -> Nota:" << curNote->name
+           << "| Frecuencia objetivo:" << curNote->freq << "Hz";
+
   QString nname = curNote->name;
   if (nname.size() == 1) {
     nname.append(QString(" "));
@@ -110,18 +126,30 @@ void Tuner::setDisplayedNote(note_t *note)
   ui.noteDisp->setText(nname);
   ui.freqDisp->display(curNote->freq);
   aProc->setWheelFreq(note->freq);
+
+  if (!ui.autoDetect->isChecked()) {
+    const int idx = ui.noteSelBox->findData(note->a4_offset);
+    if (idx >= 0 && ui.noteSelBox->currentIndex() != idx) {
+      const QSignalBlocker blocker(ui.noteSelBox);
+      ui.noteSelBox->setCurrentIndex(idx);
+    }
+  }
 }
 
 void Tuner::on_autoDetect_clicked(bool clicked)
 {
   ui.noteSelBox->setEnabled(clicked);
-  
+
   if (clicked) {
+    aProc->setNoteDetect(false);
     int curIndex = ui.noteSelBox->currentIndex();
-    int noteIdx = ui.noteSelBox->itemData(curIndex).toInt();
-    note_t *note = notes.get_note_offset(noteIdx);
-    setDisplayedNote(note);
+    if (curIndex >= 0) {
+      int noteIdx = ui.noteSelBox->itemData(curIndex).toInt();
+      note_t *note = notes.get_note_offset(noteIdx);
+      setDisplayedNote(note);
+    }
   } else {
+    aProc->setNoteDetect(true);
     setDisplayedNote(aProc->getCurNote());
   }
 }
@@ -134,9 +162,11 @@ void Tuner::on_A4SpinBox_valueChanged(double freq)
 
 void Tuner::on_noteSelBox_currentIndexChanged(int index)
 {
-  int noteIdx = ui.noteSelBox->itemData(index).toInt();
-  note_t *note = notes.get_note_offset(noteIdx);
-  setDisplayedNote(note);
+  if (index >= 0 && ui.autoDetect->isChecked()) {
+    int noteIdx = ui.noteSelBox->itemData(index).toInt();
+    note_t *note = notes.get_note_offset(noteIdx);
+    setDisplayedNote(note);
+  }
 }
 
 void Tuner::about()

@@ -110,7 +110,7 @@ void AudioProc::setWheelFreq(double newFreq)
 
 void AudioProc::setNoteDetect(bool state)
 {
-  noteDetect = !state;
+  noteDetect = state;
 }
 
 void AudioProc::setHysteresis(double newValue)
@@ -142,13 +142,19 @@ void AudioProc::readAudio()
   filter->filter(readFrames);
 
   float rms = 0.0f;
+  float maxSignal = 0.0f;
   for (qint64 i = 0; i < readFrames; ++i) {
+    float absVal = std::abs(outBuffer[i]);
+    if (absVal > maxSignal) {
+      maxSignal = absVal;
+    }
     rms += outBuffer[i] * outBuffer[i];
   }
   rms = std::sqrt(rms / static_cast<float>(readFrames));
 
   int maxNoUpdate = fSample / 10;
   float detectedFreq = -1.0f;
+  int tauSelected = -1;
 
   if (rms >= hysteresis && readFrames >= (yinBufferSize * 2)) {
     // =========================================================================
@@ -174,7 +180,7 @@ void AudioProc::readAudio()
     // Algoritmo YIN
     // =========================================================================
 
-    // Paso 1: Función de diferencia cuadrática
+    // Paso 1: Diferencia cuadrática
     for (int tau = 0; tau < yinBufferSize; ++tau) {
       yinBuffer[tau] = 0.0f;
       for (int i = 0; i < yinBufferSize; ++i) {
@@ -183,7 +189,7 @@ void AudioProc::readAudio()
       }
     }
 
-    // Paso 2: Diferencia acumulada media normalizada (CMND)
+    // Paso 2: CMND
     yinBuffer[0] = 1.0f;
     float runningSum = 0.0f;
     for (int tau = 1; tau < yinBufferSize; ++tau) {
@@ -196,7 +202,6 @@ void AudioProc::readAudio()
     }
 
     // Paso 3: Umbral absoluto
-    int tauSelected = -1;
     for (int tau = 2; tau < yinBufferSize; ++tau) {
       if (yinBuffer[tau] < yinThreshold) {
         while (tau + 1 < yinBufferSize && yinBuffer[tau + 1] < yinBuffer[tau]) {
@@ -219,11 +224,8 @@ void AudioProc::readAudio()
       }
     }
 
-    // =========================================================================
-    // Compuerta de Confianza (Confidence Gating) y Paso 4
-    // =========================================================================
+    // Paso 4: Interpolación parabólica y compuerta de confianza
     if (tauSelected > 0 && yinBuffer[tauSelected] <= yinThreshold) {
-      // Paso 4: Interpolación parabólica
       float betterTau = static_cast<float>(tauSelected);
       if (tauSelected < yinBufferSize - 1) {
         float s0 = yinBuffer[tauSelected - 1];
@@ -265,9 +267,15 @@ void AudioProc::readAudio()
       std::sort(validSamples.begin(), validSamples.end());
       medianFreq = validSamples[validSamples.size() / 2];
     }
+  } else {
+    // Purga gradual del filtro en ausencia de señal
+    freqHistory[freqHistoryIdx] = 0.0f;
+    freqHistoryIdx = (freqHistoryIdx + 1) % 5;
   }
 
-  // Integración y actualización de la rueda estroboscópica
+  // =========================================================================
+  // Integración y Renderizado Estroboscópico (Wheel)
+  // =========================================================================
   if (medianFreq > 0.0f) {
     int t = static_cast<int>(fTime);
     double wheelRemainder = std::fmod(static_cast<double>(t) * tSample, 1.0 / wheelFreq);
@@ -285,17 +293,55 @@ void AudioProc::readAudio()
     fTime = 0;
   }
 
-  // Estimación y ajuste de nota musical
-  note_t *guessedNote = guesser->guessNotes(curNote, !noteDetect);
-  if (guessedNote != nullptr) {
-    emit isFlat(guesser->isFlat());
-    emit isSharp(guesser->isSharp());
-  }
+  // =========================================================================
+  // Mapeo Musical y Emisión Directa a la GUI
+  // =========================================================================
+  if (medianFreq > 0.0f) {
+    if (noteDetect) {
+      // Modo automático: encontrar la nota más cercana en frecuencia fundamental
+      note_t *bestNote = nullptr;
+      double minDiff = 1e9;
 
-  if (noteDetect && guessedNote != nullptr && guessedNote != curNote) {
-    curNote = guessedNote;
-    setWheelFreq(curNote->freq);
-    emit changedNote(curNote);
+      for (int n = 0; n < notes->total_notes; ++n) {
+        note_t *cand = notes->get_note_offset(n);
+        if (cand && cand->freq > 0.0) {
+          double diff = std::abs(std::log2(static_cast<double>(medianFreq) / cand->freq));
+          if (diff < minDiff) {
+            minDiff = diff;
+            bestNote = cand;
+          }
+        }
+      }
+
+      if (bestNote != nullptr && bestNote != curNote) {
+        curNote = bestNote;
+        setWheelFreq(curNote->freq);
+        qDebug() << "[FASE 4 - Emisión GUI] Nueva nota detectada:" << curNote->name 
+                 << "| Freq objetivo:" << curNote->freq << "Hz | Freq entrada:" << medianFreq << "Hz";
+        emit changedNote(curNote);
+      }
+    }
+
+    // Indicación de afinación Sharp / Flat relativa a curNote
+    if (curNote && curNote->freq > 0.0) {
+      double cents = 1200.0 * std::log2(static_cast<double>(medianFreq) / curNote->freq);
+      constexpr double TUNE_TOLERANCE_CENTS = 3.0;
+
+      if (cents < -TUNE_TOLERANCE_CENTS) {
+        emit isFlat(true);
+        emit isSharp(false);
+      } else if (cents > TUNE_TOLERANCE_CENTS) {
+        emit isFlat(false);
+        emit isSharp(true);
+      } else {
+        emit isFlat(false);
+        emit isSharp(false);
+      }
+    }
+  } else {
+    // Apagar indicadores si no hay señal o cae bajo la puerta
+    emit isFlat(false);
+    emit isSharp(false);
   }
 
   if ((fTime - lastUpdate) > maxNoUpdate) {

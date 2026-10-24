@@ -41,14 +41,25 @@ AudioIO::AudioIO(int fsample, int inFrameRate, QWidget *parent)
 {
   IODevice = new QBuffer(this);
   if (!IODevice->open(QIODevice::ReadWrite)) {
-    qWarning("Unable to open IODevice buffer");
+    qWarning("[AudioIO] Error: No se pudo abrir el buffer IODevice");
   }
 
   notifyTimer = new QTimer(this);
   connect(notifyTimer, &QTimer::timeout, this, &AudioIO::notify);
 
   devices = QMediaDevices::audioInputs();
-  initHW(QMediaDevices::defaultAudioInput());
+
+  // Búsqueda de dispositivo HeadRush / PipeWire o uso del por defecto
+  QAudioDevice targetDevice = QMediaDevices::defaultAudioInput();
+  for (const QAudioDevice &dev : devices) {
+    if (dev.description().contains("HeadRush", Qt::CaseInsensitive) ||
+        dev.description().contains("PipeWire", Qt::CaseInsensitive)) {
+      targetDevice = dev;
+      break;
+    }
+  }
+
+  initHW(targetDevice);
 }
 
 AudioIO::~AudioIO()
@@ -95,9 +106,15 @@ void AudioIO::initHW(const QAudioDevice &inDevice)
   QAudioDevice info = inDevice;
   if (info.isNull()) {
     info = QMediaDevices::defaultAudioInput();
+    if (info.isNull()) {
+      devices = QMediaDevices::audioInputs();
+      if (!devices.isEmpty()) {
+        info = devices.first();
+      }
+    }
   }
 
-  qDebug() << "Selected Device:" << info.description();
+  qDebug() << "[AudioIO] Dispositivo de entrada seleccionado:" << info.description();
 
   QAudioFormat audioFormat;
   audioFormat.setChannelCount(1);
@@ -110,33 +127,43 @@ void AudioIO::initHW(const QAudioDevice &inDevice)
 #endif
 
   if (!info.isFormatSupported(audioFormat)) {
-    qWarning() << "Default audio format not directly supported. Negotiating alternative format.";
-    
-    audioFormat.setSampleFormat(QAudioFormat::Int16);
-    if (!info.isFormatSupported(audioFormat)) {
-      audioFormat.setSampleFormat(QAudioFormat::Int32);
+    qWarning() << "[AudioIO] Formato mono directo no soportado. Negociando con el dispositivo...";
+
+    QAudioFormat pref = info.preferredFormat();
+    if (pref.channelCount() > 0) {
+      audioFormat.setChannelCount(pref.channelCount());
     }
 
-    qWarning() << "Negotiated Format -> Channels:" << audioFormat.channelCount()
-               << "Rate:" << audioFormat.sampleRate()
-               << "SampleFormat:" << audioFormat.sampleFormat();
-  }
-
-  const QAudioFormat::SampleFormat sFormat = audioFormat.sampleFormat();
-  if (sFormat != QAudioFormat::Float &&
-      sFormat != QAudioFormat::Int16 &&
-      sFormat != QAudioFormat::Int32) {
-    qWarning("Only Float, Int16, or Int32 formats are supported by the DSP pipeline! Exiting.");
-    exit(1);
+    if (!info.isFormatSupported(audioFormat)) {
+      audioFormat.setSampleFormat(QAudioFormat::Float);
+      if (!info.isFormatSupported(audioFormat)) {
+        audioFormat.setSampleFormat(QAudioFormat::Int16);
+        if (!info.isFormatSupported(audioFormat)) {
+          audioFormat.setSampleFormat(QAudioFormat::Int32);
+          if (!info.isFormatSupported(audioFormat)) {
+            audioFormat = pref;
+          }
+        }
+      }
+    }
   }
 
   audioSource = new QAudioSource(info, audioFormat, this);
 
+  connect(audioSource, &QAudioSource::stateChanged, this, [](QAudio::State state) {
+    qDebug() << "[FASE 1 - Captura] QAudioSource estado:" << state;
+  });
+
 #if defined(BUILD_LINUX) && BUILD_LINUX
-  audioSource->setBufferSize((fSample * audioFormat.bytesPerSample()) / frameRate);
+  audioSource->setBufferSize((audioFormat.sampleRate() * audioFormat.bytesPerSample() * audioFormat.channelCount()) / frameRate);
 #endif
 
   maxBufSize = static_cast<qint64>(maxBuffLength * audioFormat.sampleRate() * audioFormat.bytesPerSample() * audioFormat.channelCount());
+
+  qDebug() << "[AudioIO] Inicializado:" << info.description()
+           << "| Frecuencia real:" << audioSource->format().sampleRate() << "Hz"
+           << "| Canales:" << audioSource->format().channelCount()
+           << "| Formato muestra:" << audioSource->format().sampleFormat();
 }
 
 QList<QAudioDevice> AudioIO::getDevices()
@@ -176,6 +203,7 @@ void AudioIO::start()
   }
   
   started = true;
+  qDebug() << "[AudioIO] start() ejecutado | Error actual:" << audioSource->error();
 }
 
 void AudioIO::stop()
@@ -213,32 +241,53 @@ qint64 AudioIO::getAudio(float *inBuffer, int maxSamples)
     readAll = false;
   }
 
+  // =========================================================================
+  // FASE 1: AUDITORÍA DE CAPTURA
+  // =========================================================================
+  static int captureLogThrottle = 0;
+  if (++captureLogThrottle % 15 == 0) {
+    qDebug() << "[FASE 1 - Captura] Buffer total:" << IODevice->size()
+             << "bytes | Posición escritura:" << writePointer
+             << "bytes | Bytes a leer:" << bytesToRead
+             << "| Muestras:" << samplesToRead;
+  }
+
   IODevice->seek(readPointer);
   qint64 readSamples = 0;
+  const qint64 totalStreamSamples = samplesToRead * channelCount;
 
   if (format.sampleFormat() == QAudioFormat::Float) {
-    readSamples = IODevice->read(reinterpret_cast<char*>(inBuffer), bytesToRead) / frameSize;
+    if (channelCount == 1) {
+      readSamples = IODevice->read(reinterpret_cast<char*>(inBuffer), bytesToRead) / frameSize;
+    } else {
+      QVarLengthArray<float, 4096> floatBuf(totalStreamSamples);
+      const qint64 bytesRead = IODevice->read(reinterpret_cast<char*>(floatBuf.data()), bytesToRead);
+      readSamples = bytesRead / frameSize;
+      for (qint64 i = 0; i < readSamples; ++i) {
+        inBuffer[i] = floatBuf[i * channelCount];
+      }
+    }
   } 
   else if (format.sampleFormat() == QAudioFormat::Int16) {
     constexpr float scale16 = 1.0f / 32768.0f;
-    QVarLengthArray<qint16, 4096> int16Buf(samplesToRead);
+    QVarLengthArray<qint16, 4096> int16Buf(totalStreamSamples);
 
     const qint64 bytesRead = IODevice->read(reinterpret_cast<char*>(int16Buf.data()), bytesToRead);
     readSamples = bytesRead / frameSize;
 
     for (qint64 i = 0; i < readSamples; ++i) {
-      inBuffer[i] = static_cast<float>(int16Buf[i]) * scale16;
+      inBuffer[i] = static_cast<float>(int16Buf[i * channelCount]) * scale16;
     }
   } 
   else if (format.sampleFormat() == QAudioFormat::Int32) {
     constexpr float scale32 = 1.0f / 2147483648.0f;
-    QVarLengthArray<qint32, 4096> int32Buf(samplesToRead);
+    QVarLengthArray<qint32, 4096> int32Buf(totalStreamSamples);
 
     const qint64 bytesRead = IODevice->read(reinterpret_cast<char*>(int32Buf.data()), bytesToRead);
     readSamples = bytesRead / frameSize;
 
     for (qint64 i = 0; i < readSamples; ++i) {
-      inBuffer[i] = static_cast<float>(int32Buf[i]) * scale32;
+      inBuffer[i] = static_cast<float>(int32Buf[i * channelCount]) * scale32;
     }
   }
 
